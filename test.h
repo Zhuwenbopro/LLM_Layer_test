@@ -6,6 +6,8 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <cassert>
+#include <unordered_map>
 
 // 随机数生成器
 std::random_device rd;
@@ -34,6 +36,25 @@ inline void check_error(const std::string&  message){
         std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
         exit(EXIT_FAILURE); \
     } \
+}
+
+
+#define CHECK_CUBLAS(call) { \
+    cublasStatus_t status = call; \
+    if(status != CUBLAS_STATUS_SUCCESS) { \
+        std::cerr << "cuBLAS Error: " << status << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+#define CHECK_CUDNN(call)                                               \
+{                                                                       \
+    cudnnStatus_t status = (call);                                      \
+    if (status != CUDNN_STATUS_SUCCESS) {                               \
+        std::cerr << "cuDNN error in " << __FILE__ << ":" << __LINE__   \
+                  << " - " << cudnnGetErrorString(status) << std::endl; \
+        exit(EXIT_FAILURE);                                             \
+    }                                                                   \
 }
 
 class Device {
@@ -145,29 +166,38 @@ public:
 
 class Test {
 private:
-    std::vector<float*> _list;
+    std::vector<float*> cpu_list;
+    std::vector<float*> cuda_list;
+    std::unordered_map<std::string, Device*> devices;
     std::string _device = "cpu";
-    Device* dev;
+    Device* cur_dev;
 
 public:
     Test() {
-        dev = new CPU();
+        devices["cpu"] = new CPU();
+        devices["cuda"] = new CUDA();
+        cur_dev = devices["cpu"];
     }
 
     ~Test() {
-        while(!_list.empty()) {
-            float* removed = _list.back();
-            _list.pop_back();
-            dev->free(removed);
+        while(!cpu_list.empty()) {
+            float* removed = cpu_list.back();
+            cpu_list.pop_back();
+            devices["cpu"]->free(removed);
+        }
+
+        while(!cuda_list.empty()) {
+            float* removed = cuda_list.back();
+            cuda_list.pop_back();
+            devices["cuda"]->free(removed);
         }
     }
 
     void setDevice(const std::string& device) {
-        delete dev;
         if(device == "cpu") {
-            dev = new CPU();
+            cur_dev = devices["cpu"];
         } else if(device == "cuda") {
-            dev = new CUDA();
+            cur_dev = devices["cuda"];
         } else {
             throw std::logic_error("Do not have device : " + _device);
         }
@@ -175,13 +205,21 @@ public:
     }
 
     float* getArr(size_t size, bool autofill = false) {
-        float* ret = dev->malloc(size, autofill);
-        _list.push_back(ret);
+        float* ret = cur_dev->malloc(size, autofill);
+        if(_device == "cpu")  cpu_list.push_back(ret);
+        if(_device == "cuda") cuda_list.push_back(ret);
         return ret;
     }
 
+    inline float* get_from_cpu(float* __restrict__ src, size_t size) {
+        assert(_device == "cuda");
+        float* tmp = getArr(size);
+        CHECK_CUDA(cudaMemcpy(tmp, src, size*sizeof(float), cudaMemcpyHostToDevice));
+        return tmp;
+    }
+
     inline void copy(float* __restrict__ dst, float* __restrict__ src, size_t size) {
-        dev->copy(dst, src, size);
+        cur_dev->copy(dst, src, size);
     }
 
     void print(float* a, size_t col, size_t row = 1, const std::string& msg = "") {
@@ -231,9 +269,9 @@ public:
 
         // 输出是否一致
         if (results_match) {
-            check_pass("["+msg+"] The results are consistent.\n");
+            check_pass("\n["+msg+"] The results are consistent.\n");
         } else {
-            check_error("["+msg+"] The results are NOT consistent!!!\n");
+            check_error("\n["+msg+"] The results are NOT consistent!!!\n");
         }
 
         if(_device == "cuda") {
@@ -243,14 +281,14 @@ public:
     }
 
     void start_timing() {
-        dev->time_tick();
+        cur_dev->time_tick();
     }
 
     void end_timing() {
-        dev->time_stop();
+        cur_dev->time_stop();
     }
 
     float duration() {
-        return dev->duration();
+        return cur_dev->duration();
     }
 };
